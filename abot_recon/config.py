@@ -25,6 +25,7 @@ class InferenceConfig:
     loop_salad_checkpoint: Path = Path("checkpoints/loop/dino_salad.ckpt")
     loop_dino_checkpoint: Path = Path("checkpoints/loop/dinov2_vitb14_pretrain.pth")
     loop_output_dir: Path = Path("outputs/loop")
+    latent_prediction: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.amp_dtype not in {"fp32", "fp16", "bf16"}:
@@ -39,6 +40,8 @@ class InferenceConfig:
             raise ValueError("max_frames must be positive")
         if not 0.0 <= self.confidence_threshold <= 1.0:
             raise ValueError("confidence_threshold must be in [0, 1]")
+        if self.latent_prediction is not None and not isinstance(self.latent_prediction, dict):
+            raise ValueError("latent_prediction must be a dict (add-on config) or None")
 
     def override(self, **values: Any) -> "InferenceConfig":
         """Return a validated copy with API/CLI overrides applied."""

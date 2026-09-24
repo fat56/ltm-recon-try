@@ -95,6 +95,9 @@ class ABotReconNetwork(Pi3):
         self.local_window_frames = int(_lwf)
 
         _gate_layers_cfg = kwargs.pop("gate_layers", None) or []
+        # Add-on JEPA-style latent prediction (see latent_prediction.py);
+        # must be popped before super().__init__(**kwargs).
+        _lp_cfg_raw = kwargs.pop("latent_prediction", None)
 
         _num_summary = kwargs.pop("num_summary_tokens", 0)
         self.global_pos_encoding = str(kwargs.pop("global_pos_encoding", "pi3_2d")).lower()
@@ -193,6 +196,39 @@ class ABotReconNetwork(Pi3):
                     )
             except Exception:
                 pass
+
+        # ── Latent prediction (JEPA-style next-frame prior) ─────────────────────
+        # Add-on modules only; `latent_prediction=None` (default) leaves the
+        # network byte-identical to the released behaviour.
+        from abot_recon.modeling.streaming.latent_prediction import (
+            build_latent_prediction_manager,
+        )
+
+        _lp_descriptor_dim = int(
+            getattr(self.camera_head, "hidden_dim", None)
+            or getattr(self.camera_head, "dim", 512)
+        )
+        self.latent_prediction = build_latent_prediction_manager(
+            _lp_cfg_raw,
+            token_dim=2 * self.dec_embed_dim,
+            descriptor_dim=_lp_descriptor_dim,
+            num_history_frames=int(self.local_window_frames),
+        )
+        if self.latent_prediction is not None:
+            if self.infer_mode != "stream":
+                print(
+                    "[ABotReconNetwork] latent_prediction WARNING: only active on "
+                    f"per-frame stream paths; this model uses infer_mode={self.infer_mode!r}.",
+                    flush=True,
+                )
+            print(
+                "[ABotReconNetwork] latent_prediction enabled "
+                f"(action_source={self.latent_prediction.config.action_source}, "
+                f"ring_frames={self.latent_prediction.config.num_history_frames} "
+                f"(kv_window={self.local_window_frames}), "
+                f"fusion={self.latent_prediction.config.enable_fusion}).",
+                flush=True,
+            )
 
         if _deferred_ckpt is not None:
             self._load_deferred_streaming_checkpoint(_deferred_ckpt)
@@ -640,6 +676,19 @@ class ABotReconNetwork(Pi3):
             streaming_inference=streaming_inference,
         )
 
+        # Latent-prediction fusion: per-frame stream paths only.  `trunk_hidden`
+        # keeps the unfused trunk output for the prediction ring buffer.
+        _lp_active = (
+            self.latent_prediction is not None
+            and N == 1
+            and (stream_use_cache or streaming_inference)
+        )
+        trunk_hidden = hidden
+        if _lp_active:
+            hidden = self.latent_prediction.fuse_frame(
+                hidden, first_frame=past_key_values is None
+            )
+
         new_ref_hidden: Optional[torch.Tensor] = None
         if self.use_global_points:
             if stream_use_cache and N == 1:
@@ -708,6 +757,14 @@ class ABotReconNetwork(Pi3):
                 camera_poses,
                 homogenize_points(local_points),
             )[..., :3]
+
+        if _lp_active and new_camera_state is not None:
+            self.latent_prediction.observe_frame(
+                trunk_hidden,
+                new_camera_state,
+                first_frame=past_key_values is None,
+                pos=pos,
+            )
 
         out: Dict[str, Any] = dict(
             points=points,
@@ -1069,6 +1126,13 @@ class ABotReconNetwork(Pi3):
 
         hidden, pos = self._decode_paged(hidden, H=H, W=W, frame_idx=frame_idx)
 
+        # Latent-prediction fusion (per-frame paged path).
+        trunk_hidden = hidden
+        if self.latent_prediction is not None:
+            hidden = self.latent_prediction.fuse_frame(
+                hidden, first_frame=frame_idx == 0
+            )
+
         new_ref_hidden: Optional[torch.Tensor] = None
         global_point_hidden = None
         if self.use_global_points:
@@ -1131,6 +1195,14 @@ class ABotReconNetwork(Pi3):
                 homogenize_points(local_points),
             )[..., :3]
 
+        if self.latent_prediction is not None and new_camera_state is not None:
+            self.latent_prediction.observe_frame(
+                trunk_hidden,
+                new_camera_state,
+                first_frame=frame_idx == 0,
+                pos=pos,
+            )
+
         out: Dict[str, Any] = dict(
             points=points,
             local_points=local_points,
@@ -1191,6 +1263,12 @@ class ABotReconNetwork(Pi3):
                 streaming_inference=True,
             )
 
+        # Latent-prediction fusion (per-frame camera-only path).
+        _lp_first = bool(frame_idx == 0) if use_paged else past_key_values is None
+        trunk_hidden = hidden
+        if self.latent_prediction is not None:
+            hidden = self.latent_prediction.fuse_frame(hidden, first_frame=_lp_first)
+
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
         with torch.amp.autocast(device_type="cuda", enabled=False):
             camera_hidden = camera_hidden.float()
@@ -1212,6 +1290,14 @@ class ABotReconNetwork(Pi3):
             if new_camera_state is not None:
                 new_camera_state.pop("_aux_rel_pose_pred", None)
                 new_camera_state.pop("_history_rel_pose_pred", None)
+
+        if self.latent_prediction is not None and new_camera_state is not None:
+            self.latent_prediction.observe_frame(
+                trunk_hidden,
+                new_camera_state,
+                first_frame=_lp_first,
+                pos=pos,
+            )
 
         out: Dict[str, Any] = {"camera_poses": camera_poses}
         if pkv is not None:

@@ -105,6 +105,11 @@ class ReleasedABotReconModel(torch.nn.Module):
                 local_window_frames=config.local_window_frames,
                 infer_mode="stream",
                 gate_layers=list(range(36)),
+                latent_prediction=(
+                    dict(config.latent_prediction)
+                    if config.latent_prediction is not None
+                    else None
+                ),
             )
         self.disabled_packaged_flash_modules = disable_unavailable_packaged_flash_attention(
             self.network
@@ -113,13 +118,28 @@ class ReleasedABotReconModel(torch.nn.Module):
         self.device_name = config.device
         self.compute_dtype = _torch_dtype(config.amp_dtype)
         # The network is constructed directly on its execution device above.
-        load_model_checkpoint(self.network, config.checkpoint)
+        _latent_prediction = getattr(self.network, "latent_prediction", None)
+        if _latent_prediction is not None:
+            # Released checkpoints predate the add-on latent-prediction head, so
+            # its freshly-initialised parameters are the only keys allowed to be
+            # absent.  Temporarily detach the submodule (nn.Module supports
+            # assigning None to deregister) for the strict load, then restore.
+            self.network.latent_prediction = None
+            try:
+                load_model_checkpoint(self.network, config.checkpoint)
+            finally:
+                self.network.latent_prediction = _latent_prediction
+        else:
+            load_model_checkpoint(self.network, config.checkpoint)
         self.eval()
 
     def reset(self) -> None:
         manager = getattr(self.network, "_paged_manager", None)
         if manager is not None:
             manager.reset()
+        latent_prediction = getattr(self.network, "latent_prediction", None)
+        if latent_prediction is not None:
+            latent_prediction.reset()
 
     def _frames(self, paths: Iterable[Path]):
         for tensor, _ in iter_preprocessed(

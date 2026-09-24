@@ -69,6 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("checkpoints/loop/dinov2_vitb14_pretrain.pth"),
     )
     parser.add_argument("--loop-output-dir", type=Path, default=Path("outputs/loop"))
+    parser.add_argument(
+        "--latent-prediction",
+        type=str,
+        default=None,
+        help=(
+            "JSON string enabling the add-on latent-prediction head, e.g. "
+            '\'{"enabled": true, "action_source": "extrapolator_and_descriptor"}\' '
+            "(default: disabled)"
+        ),
+    )
     return parser
 
 
@@ -108,6 +118,9 @@ def main(argv=None) -> None:
         raise ValueError("dense-stride must be positive")
     save_local_points = args.save_local_points or args.save_points
     save_world_points = args.save_world_points or args.save_points
+    latent_prediction = None
+    if args.latent_prediction is not None:
+        latent_prediction = json.loads(args.latent_prediction)
     model = ABotRecon.from_pretrained(
         args.checkpoint,
         device=args.device,
@@ -122,6 +135,7 @@ def main(argv=None) -> None:
         loop_salad_checkpoint=args.loop_salad_checkpoint,
         loop_dino_checkpoint=args.loop_dino_checkpoint,
         loop_output_dir=args.loop_output_dir,
+        latent_prediction=latent_prediction,
     )
     dense_indices = None
     if args.dense_stride > 1 and (
