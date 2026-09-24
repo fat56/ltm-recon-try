@@ -1,274 +1,162 @@
 <div align="center">
 
-# ABot-Recon
+# ltm-recon-try
 
-## Revisiting Local Context for Long-Horizon Streaming 3D Reconstruction
+## 面向流式 3D 重建的潜变量预测先验 —— 研究方案仓库
 
-[English](README.md) | [中文](README_ZH.md)
-
-[![Arxiv](https://img.shields.io/static/v1?label=Paper&message=arXiv&color=5B6F9A&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2608.27529)
-[![Tech PDF](https://img.shields.io/static/v1?label=Paper&message=PDF&color=6A83A8&logo=adobeacrobatreader&logoColor=white)](https://github.com/amap-cvlab/ABot-Recon/blob/main/ABot-Recon-Tech-Report.pdf)  
-[![Project](https://img.shields.io/static/v1?label=Project&message=Website&color=2F7F83&logo=googlechrome&logoColor=white)](https://amap-cvlab.github.io/ABot-Recon-html)
-[![Code](https://img.shields.io/static/v1?label=Code&message=GitHub&color=333333&logo=github&logoColor=white)](https://github.com/amap-cvlab/ABot-Recon)
-[![Hugging Face](https://img.shields.io/static/v1?label=%F0%9F%A4%97%20Model&message=Hugging%20Face&color=7867A8)](https://huggingface.co/acvlab/ABot-Recon)
-[![ModelScope](https://img.shields.io/static/v1?label=%F0%9F%A4%96%20Model&message=ModelScope&color=5578B8)](https://modelscope.cn/models/amap_cvlab/ABot-Recon)
-[![Online Demo](https://img.shields.io/static/v1?label=%F0%9F%8C%90%20Online%20Demo&message=ModelScope&color=328C8C)](https://modelscope.cn/studios/amap_cvlab/ABot-Recon)
-[![Online Demo](https://img.shields.io/static/v1?label=%F0%9F%A4%97%20Online%20Demo&message=Hugging%20Face&color=7867A8)](https://huggingface.co/spaces/acvlab/abot-recon-streaming-3d)
-[![License](https://img.shields.io/static/v1?label=License&message=Apache-2.0&color=438A68)](LICENSE)
+基于 [ABot-Recon](https://github.com/amap-cvlab/ABot-Recon) 的改进研究：在不动基座模型的前提下，外挂 V-JEPA 式的下一帧潜变量预测器
 
 </div>
 
-<p align="center">
-  <img src="assets/teaser.png" width="85%" alt="ABot-Recon long-horizon reconstruction teaser">
-</p>
+> **一句话**：保留 ABot-Recon 12 帧局部上下文的流式框架，旁挂一个 action 条件化的潜变量预测器——用历史帧的 trunk 表征预测下一帧表征，经零初始化门控注意力融合回感知通路，为 depth / pose 提供时序先验，同时产出免费的新颖性（novelty）信号。
 
-> **In one sentence:** ABot-Recon reconstructs long video streams with a fixed 12-frame local context, composing current-frame geometry and adjacent relative poses into a global reconstruction without persistent learned long-range memory. 
+---
 
-## 📣 News
+## 1. 方案概述
 
-- **2026-08-31:** Thanks to the Hugging Face team, an interactive [ABot-Recon Demo](https://huggingface.co/spaces/acvlab/abot-recon-streaming-3d) is now available online. Try it out!
+流式稠密重建中，当前帧的 trunk 表征在运动模糊、遮挡、弱纹理、曝光突变时会退化，而这些恰是历史信息不受影响的时刻。本方案在帧 k 处理**之前**就固化一份"对第 k 帧的期望"（由 ≤ k-1 帧信息生成），在帧 k 到来后与实际表征做门控融合，并用预测误差标记新内容：
 
-## Why local context?
+```
+帧 k-1 forward 末尾（生成先验）:
+  motion history ──→ PoseExtrapolator ──→ T̂_{k-1→k} ──→ action token ─┐
+  previous_descriptor（pose head 状态字典，已 detach）──────────────────┤
+  ring buffer（trunk 输出快照，默认=KV 窗口 12 帧）─────────────────────┴→ LatentPredictor → ẑ_k
 
-Long-horizon streaming reconstruction is often approached by adding increasingly elaborate mechanisms for retaining and fusing long-range state. ABot-Recon takes a deliberately local route. At each time step, it solves the same bounded prediction problem:
-
-- cache KV features from the preceding 11 frames;
-- predict a point map $P_i$ in the current camera coordinate system;
-- estimate the adjacent relative pose $T_{i-1\leftarrow i}$; and
-- recover the global trajectory and point cloud through sequential pose composition.
-
-This design keeps model-state memory and per-frame computation independent of the elapsed sequence length. A lightweight motion-visual rotation refiner and composition-aware pose loss are used to limit drift when local poses are composed over long horizons.
-
-## Results at a glance
-
-<p align="center">
-  <img src="benchmark_comparison_transparent.png" width="82%" alt="ABot-Recon comparison on Oxford Spires and KITTI-02">
-</p>
-
-| Evaluation | Result | Setting |
-|---|---:|---|
-| Oxford Spires camera pose | ATE **4.35 m**, RPE-R **0.12°** | Streaming model only; no loop closure |
-| Oxford Spires dense reconstruction | CD **1.37 m**, F1 **91.81%** | F1 threshold $\tau=4$ m |
-| KITTI-02 streaming efficiency | **24.45 FPS**, **6.71 GiB** | 504×280, NVIDIA H100, input storage excluded |
-
-The full paper reports camera-pose results on KITTI, Oxford Spires, and VBR, together with dense reconstruction on 7Scenes, TUM-Dynamic, and Oxford Spires.
-
-## Installation
-
-The released configuration targets Linux, Python 3.10 or later, PyTorch 2.5.1, and CUDA 12.1. The release environment was validated on NVIDIA A100, while the paper's runtime benchmark uses an NVIDIA H100.
-
-```bash
-conda create -n abot-recon python=3.11 -y
-conda activate abot-recon
-
-pip install torch==2.5.1 torchvision==0.20.1 \
-  --index-url https://download.pytorch.org/whl/cu121
-pip install -e .
+帧 k forward（消费先验）:
+  trunk（encoder + 36 块 decoder）→ h_k ──→ GatedFusion(h_k, ẑ_k) ──→ point / camera heads
 ```
 
-### Recommended acceleration
+四个要点：
 
-ABot-Recon uses paged KV-cache operators from FlashInfer when they are available and falls back to PyTorch SDPA otherwise. Compiling cuRoPE further accelerates rotary position encoding.
+1. **Ring buffer**：与 KV cache 并行地保留最近帧的 trunk 最终输出快照（每帧 ~3MB，容量默认自动跟随 `local_window_frames`）；
+2. **旁挂 LatentPredictor**（~45M，6L/768）：输入历史快照 + action 条件 token，输出下一帧 trunk 表征预测；在帧 k-1 结束时生成、帧 k 融合时消费；
+3. **GatedFusion**（Flamingo 式零初始化门控注意力）：主表征 query 预测表征，融合后再进 depth / pose heads；
+4. **action 条件六档**（`action_source`）：`none` / `const_velocity`（滞后一步恒速）/ `previous_descriptor`（视角摘要）/ 二者组合（默认）/ `extrapolator`（小型位姿外推器，复用 TemporalRotationRefiner 的滚动窗口+age embedding+门控深度卷积模式）/ 外推器+描述符。
 
-```bash
-pip install flashinfer-python
-flashinfer show-config
+**架构不变量**（有测试锁定）：
 
-cd abot_recon/modeling/pi3/models/curope
-pip install ninja
-python setup.py build_ext --inplace
-cd -
-```
+- 融合点在 trunk 之后 → 融合结果**不进入**后续帧的 KV cache，流式因果性不被污染；
+- ring 只存**未融合**的 trunk 输出 → 预测目标一致；
+- 零初始化门控 → **未训练时输出与基座模型逐位相等**，劣质预测器只会被"关门"，下界伤害 ≈ 0；
+- 逐 token 预测误差（`last_prediction_error`）是免费的 novelty / 动态物体信号，可馈入置信度头与 `sparse_loop` 关键帧选择。
 
-## Model checkpoint
+## 2. 与相关工作的差异定位
 
-The released checkpoint is available on [Hugging Face](https://huggingface.co/acvlab/ABot-Recon) and [ModelScope](https://modelscope.cn/models/amap_cvlab/ABot-Recon). The Python API and demo download it automatically from Hugging Face and reuse the local cache. For offline inference, download the checkpoint manually and place it at:
+| 工作 | 关系 | 差异 |
+|---|---|---|
+| V-JEPA 2 / 2-AC (arXiv:2506.09985) | latent 级下一帧预测 + action 条件 | 其预测器（300M，block-causal）用于规划与在线适应，**不回流感知**；我们将预测先验融合回感知通路 |
+| PredNet 等预测编码 | 误差驱动的分层感知 | 其在监督信号层级传播误差；我们在 token 层级做先验融合 |
+| Flamingo (arXiv:2204.14198) | 零初始化门控跨注意力注入 | 其融合外部模态；我们融合"时间上的自我" |
+| CUT3R / Spann3R / StreamVGGT | 流式 3D 感知的记忆机制 | 它们改主干为递归/记忆式，破坏 checkpoint 兼容；我们旁挂式，基座权重不失效、可整体关闭 |
 
-```text
-checkpoints/abot_recon.safetensors
-```
+## 3. 实现状态
 
-## Quick start
+- [x] 全部新模块（`abot_recon/modeling/streaming/latent_prediction.py`）：`LatentPredictor` / `PoseExtrapolator` / `ActionTokenEncoder` / `GatedFusion` / `LatentPredictionManager` / JEPA 损失
+- [x] 三条逐帧推理路径集成（SDPA 流式 / FlashInfer paged / camera-only），`infer_mode=full` 下自动禁用并告警
+- [x] 配置开关：`InferenceConfig.latent_prediction` / CLI `--latent-prediction '<json>'` / 构造器 kwarg
+- [x] released checkpoint 兼容（严格加载 + 新模块键宽容）
+- [x] 28 项测试，含"开启未训练 == 关闭"的逐位一致回归、分辨率变化自动 reset、六种 action_source 协议测试
+- [ ] Stage 1：predictor / extrapolator 预训练（JEPA 损失 + GT 位姿回归）
+- [ ] Stage 2：融合门控微调（任务损失）
+- [ ] 基准评测与消融（见 §5）
 
-The base model requires neither loop-closure dependencies nor loop assets. Input images are sorted lexicographically, so frame names should be zero-padded (for example, `000001.jpg`, `000002.jpg`, ...).
+实现细节、逐文件改动说明与训练路线：见 **[plam.md](plam.md)**。
 
-```bash
-python demo.py \
-  --image-dir examples/images \
-  --output-dir outputs/demo \
-  --attention-backend auto \
-  --no-loop-closure
-```
+## 4. 使用方式
 
-This minimal example performs one causal pass and writes the raw camera trajectory, adjacent relative poses, local point maps, confidence maps, and run metadata. See [Optional loop closure](#optional-loop-closure) for trajectory refinement on sequences with revisited regions.
-
-Useful output controls:
-
-| Option | Effect |
-|---|---|
-| `--save-world-points` | Transform local point maps using the final trajectory and save a global point cloud |
-| `--no-save-local-points` | Skip per-frame local point maps |
-| `--no-save-confidence` | Skip confidence maps |
-| `--confidence-threshold T` | Mask points below confidence `T` in `[0, 1]` |
-| `--loop-closure` / `--no-loop-closure` | Enable or disable optional loop-closure refinement; enabled by default |
-| `--start`, `--end`, `--stride` | Select frames from the ordered input stream |
-| `--dense-stride N` | Estimate every selected-frame pose but save dense outputs every `N` frames |
-| `--max-frames N` | Set the maximum supported stream length; default: `22000` |
-
-### Python API
+基座推理用法与上游一致（见 §6）。开启潜变量预测：
 
 ```python
-from pathlib import Path
 from abot_recon import ABotRecon
-
-images = sorted(Path("examples/images").glob("*.jpg"))
 
 model = ABotRecon.from_pretrained(
     "acvlab/ABot-Recon",
     device="cuda",
-    attention_backend="auto",
     loop_closure=False,
+    latent_prediction={
+        "enabled": True,
+        "action_source": "extrapolator_and_descriptor",  # 见 plam.md 六档说明
+        # 其余项走默认：ring 自动跟随 KV 窗口(12)，predictor 6L/768，融合开启
+    },
 )
-
 result = model.infer(images)
-
-trajectory = result.camera_poses
-relative_poses = result.relative_poses
-local_points = result.local_points
-confidence = result.confidence
 ```
-
-The checkpoint is downloaded once and then loaded from the Hugging Face cache.
-For offline inference, replace the repository ID with a local checkpoint path.
-
-Set `output_world_points=True` to return point maps transformed by the final trajectory. Use `dense_output_indices` when dense geometry is needed for only a subset of frames.
-
-## Optional loop closure
-
-The learned model does not depend on loop closure. When a sequence contains useful revisits, the optional backend retrieves candidate frame pairs with DINOv2-SALAD descriptors, predicts relative-pose constraints with ABot-Recon, and refines the trajectory through sparse pose-graph optimization.
-
-Install the optional dependencies and download the retrieval checkpoints:
 
 ```bash
-pip install -e ".[loop]"
-python scripts/download_loop_assets.py --output-dir checkpoints/loop
+python -m abot_recon.cli --image-dir examples/images \
+  --latent-prediction '{"enabled": true, "action_source": "extrapolator_and_descriptor"}'
 ```
 
-Expected files:
+注意：新模块当前为随机初始化（未训练时门控保持关闭、输出与基座一致），需按 §5 训练后才有增益。诊断接口：`model.model.network.latent_prediction.diagnostics()`（门控幅度、预测误差统计）。
 
-```text
-checkpoints/
-├── abot_recon.safetensors
-└── loop/
-    ├── dino_salad.ckpt
-    └── dinov2_vitb14_pretrain.pth
-```
+## 5. 训练与实验计划
 
-Run inference with loop closure:
+**三阶段**：
+
+1. **Stage 1 — 预训练**：冻结主干，`latent_prediction_loss(ẑ, sg(z))` 训 predictor；extrapolator 用 GT 相对位姿做 next-pose 回归（可独立预训练）。
+   *缓存技巧*：Stage 1 无需重跑 1B 主干——先缓存 (z_k, descriptor, rel_poses, pos)，predictor 在缓存特征上训练，容量扫描近乎免费。
+2. **Stage 2 — 融合微调**：只训门控（+ predictor 小 lr），走现有 depth/pose/conf 任务损失；监控门控幅度（塌 0 = 预测无价值，全开 = 过信任/拖影）。
+3. **Stage 3（可选）— 联合微调**：预测目标换 EMA target trunk，防止主干学成"好预测"的表征。
+
+**消融顺序**（核心假设检验）：`none` → `const_velocity` → `previous_descriptor` → `extrapolator_and_descriptor`；外加 `enable_fusion=False`（纯误差监控）与 trivial-prior 基线（ẑ_k = z_{k-1} 复制）对照。
+
+**容量消融**：2L/512 → 6L/768 → 12L/1024，以 held-out **场景**（非帧）的 JEPA loss 判定欠拟合/过拟合。
+
+**评测**：7-Scenes / TUM-RGBD / ScanNet / KITTI 流式协议（沿用上游 `eval` 分支），外加门控激活统计与预测误差-遮挡相关性分析。
+
+## 6. 基座模型：ABot-Recon
+
+ABot-Recon（[arXiv:2608.27529](https://arxiv.org/abs/2608.27529)）以 12 帧局部上下文做长时程流式重建：缓存前 11 帧 KV，逐帧预测当前相机系点图与相邻相对位姿，经序贯位姿合成恢复全局轨迹与点云；轻量旋转修正器与合成感知位姿损失抑制漂移。本仓库在其发布代码基础上做上述扩展，基座行为可通过开关完全还原。
+
+### 安装
 
 ```bash
-python demo.py \
-  --image-dir examples/images \
-  --output-dir outputs/demo_loop \
-  --attention-backend auto \
-  --loop-closure
+conda create -n abot-recon python=3.11 -y
+conda activate abot-recon
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+pip install -e .
+
+# 可选加速
+pip install flashinfer-python
+cd abot_recon/modeling/pi3/models/curope && pip install ninja && python setup.py build_ext --inplace && cd -
 ```
 
-When loop closure is enabled, `camera_poses` stores the refined trajectory, while `camera_poses_noloop` preserves the raw streaming prediction.
+### 检查点
 
-## Outputs
+发布权重在 [Hugging Face](https://huggingface.co/acvlab/ABot-Recon) 与 [ModelScope](https://modelscope.cn/models/amap_cvlab/ABot-Recon)，API 自动下载；离线使用放置于 `checkpoints/abot_recon.safetensors`。
 
-The exact set of files follows the selected output options:
-
-```text
-outputs/demo/
-├── camera_poses.npy
-├── relative_poses.npy
-├── camera_poses_noloop.npy
-├── relative_poses_noloop.npy
-├── camera_poses_loop.npy       # only with loop closure
-├── relative_poses_loop.npy     # only with loop closure
-├── local_points.pt             # enabled by default
-├── world_points.pt             # with --save-world-points
-├── colors.pt                   # RGB aligned with saved point maps
-├── confidence.pt               # enabled by default
-├── confidence_mask.pt          # enabled by default
-└── metadata.json
-```
-
-Local point maps remain in their corresponding camera coordinate systems. World points are generated using the final selected trajectory.
-
-### Visualization
+### 基座快速上手
 
 ```bash
-python scripts/export_reconstruction_ply.py \
-  --poses outputs/demo/camera_poses.npy \
-  --points outputs/demo/local_points.pt \
-  --colors outputs/demo/colors.pt \
-  --output outputs/demo/reconstruction.ply \
-  --bev-output outputs/demo/trajectory_bev.png
+python demo.py --image-dir examples/images --output-dir outputs/demo --attention-backend auto --no-loop-closure
 ```
 
-This creates an RGB point-cloud PLY and a separate BEV trajectory PNG.
+输出轨迹、相邻相对位姿、局部点图与置信度图；可视化用 `scripts/export_reconstruction_ply.py`；可选回环闭合（`pip install -e ".[loop]"` + `scripts/download_loop_assets.py`）。完整用法、输出项与评测协议见[上游 README](https://github.com/amap-cvlab/ABot-Recon)。
 
-## Evaluation
-
-Camera-pose and dense-reconstruction protocols are maintained on the `eval` branch:
-
-```bash
-git switch eval
-```
-
-That branch documents dataset preparation, third-party checkpoints, benchmark commands, and metric aggregation. Dense reconstruction is evaluated without loop closure to match the paper protocol.
-
-## Tests
+### 测试
 
 ```bash
 pytest -q
 ```
 
-CUDA-specific and real-checkpoint tests are available separately:
+## 7. 引用与致谢
 
-```bash
-ABOT_RECON_REQUIRE_CUROPE=1 pytest -q tests/test_curope_parity.py
-
-ABOT_RECON_CHECKPOINT=checkpoints/abot_recon.safetensors \
-ABOT_RECON_IMAGE_DIR=examples/images \
-ABOT_RECON_DEVICE=cuda \
-pytest -q tests/integration/test_real_checkpoint.py
-```
-
-## Release status
-
-- [ ] Training code and recipes (to be released by September 30)
-- [x] Public model checkpoint
-- [x] Inference and evaluation code
-
-## Citation
+本仓库基于 ABot-Recon 构建，基座模型引用：
 
 ```bibtex
 @misc{han2026revisitinglocalcontextlonghorizon,
-      title={Revisiting Local Context for Long-Horizon Streaming 3D Reconstruction}, 
+      title={Revisiting Local Context for Long-Horizon Streaming 3D Reconstruction},
       author={Jiarong Han and Jincheng Xiong and Yuzhou Liu and Linzhe Shi and Changjie Wu and Ning Guo and Mu Xu and Hang Zhang and Ming Qian},
       year={2026},
       eprint={2608.27529},
       archivePrefix={arXiv},
       primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2608.27529}, 
+      url={https://arxiv.org/abs/2608.27529},
 }
 ```
 
-## License and acknowledgements
+潜变量预测方案的思想来源：V-JEPA 2 / V-JEPA 2-AC（latent 预测与 action 条件化）、Flamingo（零初始化门控跨注意力）、PredNet（预测编码）；基座中的时序模块模式参考其 `TemporalRotationRefiner`。
 
-Source code is released under the [Apache License 2.0](LICENSE). Model weights are governed by [MODEL_LICENSE.md](MODEL_LICENSE.md), and third-party components are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+## 8. 许可
 
-Before using the model, please review the [Model Usage Guidelines](MODEL_USAGE_GUIDELINES.md).
-
-ABot-Recon builds on Pi3 and draws inspiration from CroCo, DUSt3R, DINOv2, SALAD, FlashInfer, LingBot-Map, HorizonStream, and LongStream. We thank their authors and contributors.
-
-We would also like to express our sincere gratitude to Zengye Ge, Hongyu Pan, Zhongxu Sun, Bentao Wang, Yuting Xu, Tianjian Ouyang, Haoming Yu, Chuzi Chen, and Zhiyang Zhang for their valuable support and contributions to this project.
-
-## Other Works from Our Group
-
-- [ABot-Earth](https://abot-earth.amap.com/)
-- [GS-Voxel](https://arxiv.org/abs/2608.17988)
+源代码遵循 [Apache License 2.0](LICENSE)；模型权重受 [MODEL_LICENSE.md](MODEL_LICENSE.md) 约束，第三方组件见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，使用模型前请阅读 [Model Usage Guidelines](MODEL_USAGE_GUIDELINES.md)。
